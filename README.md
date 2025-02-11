@@ -36,6 +36,7 @@ sudo apt install pulseaudio pulseaudio-utils  # Debian/Ubuntu
 chmod +x create_venv.sh
 ./create_venv.sh
 pip install -r requirements.txt
+sudo pacman -S python-scipy
 
 For Fix
 pactl load-module module-null-sink sink_name=virt_sink sink_properties=device.description=VirtualMic
