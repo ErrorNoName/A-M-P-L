@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
 
 # Masquer certains messages ALSA
 os.environ["ALSA_LOGLEVEL"] = "quiet"
-# Décommentez si nécessaire sous Wayland:
+# Pour Wayland (si besoin) décommentez :
 # os.environ["QT_QPA_PLATFORM"] = "wayland"
 
 def run_cmd(cmd_list):
@@ -57,7 +57,7 @@ def get_pulseaudio_source(description):
 # --- Thread de capture audio pour la prévisualisation (sans traitement) ---
 class AudioPreviewThread(QThread):
     volume_signal = pyqtSignal(float)
-
+    
     def __init__(self, device_index, sample_rate=44100, parent=None):
         super().__init__(parent)
         self.device_index = device_index
@@ -99,14 +99,16 @@ class ProcessingThread(QThread):
         self.running = True
         self.channels_in = 1
         self.channels_out = 2
-        # Pour l'effet Echo, initialisation d'un buffer et d'un index
+        # Pour l'effet Echo
         self.echo_buffer = None
         self.echo_index = 0
+        # Pour l'effet Ultra BoostBass
+        self.bass_initialized = False
 
     def callback(self, indata, outdata, frames, time_info, status):
         if status:
             print(status)
-        # Signal de base après gain
+        # Signal de base avec gain appliqué
         signal = self.gain * indata[:, 0]
         if self.effect == "None":
             outdata[:, 0] = signal
@@ -143,7 +145,6 @@ class ProcessingThread(QThread):
             outdata[:, 0] = crushed
             outdata[:, 1] = crushed
         elif self.effect == "Echo":
-            # Initialisation du buffer d'écho si nécessaire
             if self.echo_buffer is None:
                 delay_sec = 0.3
                 self.delay_samples = int(self.samplerate * delay_sec)
@@ -156,6 +157,20 @@ class ProcessingThread(QThread):
                 out[i] = signal[i] + feedback * echo_sample
                 self.echo_buffer[self.echo_index] = signal[i]
                 self.echo_index = (self.echo_index + 1) % self.delay_samples
+            outdata[:, 0] = out
+            outdata[:, 1] = out
+        elif self.effect == "Ultra BoostBass":
+            # Initialiser la partie basse si non encore fait
+            if not self.bass_initialized:
+                fc = 200.0  # Fréquence de coupure pour les basses
+                self.bass_alpha = np.exp(-2 * np.pi * fc / self.samplerate)
+                self.bass_state = 0.0
+                self.boost_factor = 20.0  # Facteur de boost pour les basses
+                self.bass_initialized = True
+            out = np.empty_like(signal)
+            for i in range(len(signal)):
+                self.bass_state = (1 - self.bass_alpha) * signal[i] + self.bass_alpha * self.bass_state
+                out[i] = signal[i] + self.boost_factor * self.bass_state
             outdata[:, 0] = out
             outdata[:, 1] = out
         else:
@@ -248,7 +263,7 @@ class MainWindow(QMainWindow):
         effect_layout = QHBoxLayout()
         effect_label = QLabel("Effet audio:")
         self.effect_combo = QComboBox()
-        self.effect_combo.addItems(["None", "Pan Left", "Stutter", "Rapid Stutter", "Ultra Loud", "Ultra Loud Raw", "Bit Crusher", "Echo"])
+        self.effect_combo.addItems(["None", "Pan Left", "Stutter", "Rapid Stutter", "Ultra Loud", "Ultra Loud Raw", "Bit Crusher", "Echo", "Ultra BoostBass"])
         self.effect_combo.currentIndexChanged.connect(self.on_effect_changed)
         effect_layout.addWidget(effect_label)
         effect_layout.addWidget(self.effect_combo)
@@ -319,11 +334,9 @@ class MainWindow(QMainWindow):
                 self.preview_thread = None
 
     def on_volume_changed(self, value):
-        # Met à jour le gain dans le traitement si actif (gain = value/100)
         if self.processing_thread is not None:
             self.processing_thread.gain = value / 100.0
 
-        # Appliquer le volume sur la source virtuelle si active, sinon sur le micro physique.
         if self.virtual_sink_module_id is not None:
             target = "virt_sink.monitor"
         else:
@@ -351,10 +364,8 @@ class MainWindow(QMainWindow):
             self.stop_virtual_mic()
 
     def start_virtual_mic(self):
-        # Arrêter la prévisualisation
         self.stop_preview()
 
-        # Vérifier si le micro virtuel existe ; sinon, le créer
         virtual_name = self.virt_lineedit.text()
         existing_source = get_pulseaudio_source(virtual_name)
         if existing_source is None:
@@ -374,16 +385,13 @@ class MainWindow(QMainWindow):
             print("Micro virtuel déjà existant.")
             self.virtual_sink_module_id = "exist"
 
-        # Attendre que PulseAudio mette à jour la liste
         time.sleep(1)
 
-        # Recharger la liste des dispositifs de sortie pour trouver le null-sink
         out_device = None
         try:
             devices = sd.query_devices()
             for i, dev in enumerate(devices):
-                if (("virt_sink" in dev.get("name", "").lower()) or (virtual_name.lower() in dev.get("name", "").lower())) \
-                   and dev.get("max_output_channels", 0) > 0:
+                if (("virt_sink" in dev.get("name", "").lower()) or (virtual_name.lower() in dev.get("name", "").lower())) and dev.get("max_output_channels", 0) > 0:
                     out_device = i
                     break
         except Exception as e:
@@ -394,7 +402,6 @@ class MainWindow(QMainWindow):
             print("Dispositif de sortie virtuel introuvable.")
             return
 
-        # Démarrer le thread de traitement : capture du micro physique vers le null-sink
         physical_device_index = self.mic_combo.currentData()
         if physical_device_index is None:
             print("Aucun micro physique sélectionné.")
@@ -422,7 +429,6 @@ class MainWindow(QMainWindow):
     def fix_audio(self):
         print("Tentative de réinitialisation des modules audio...")
         try:
-            # Si le micro virtuel n'existe pas, le créer
             if get_pulseaudio_source("VirtualMic") is None:
                 print("VirtualMic non trouvé, création du micro virtuel...")
                 run_cmd(["pactl", "load-module", "module-null-sink",
@@ -456,7 +462,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
 
-    # Appliquer un thème sombre à l'application
+    # Appliquer un thème sombre
     app.setStyle("Fusion")
     dark_palette = QPalette()
     dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
