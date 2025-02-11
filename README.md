@@ -38,7 +38,8 @@ chmod +x create_venv.sh
 pip install -r requirements.txt
 sudo pacman -S python-scipy
 
-For Fix
+Pour Fix
 pactl load-module module-null-sink sink_name=virt_sink sink_properties=device.description=VirtualMic
 yay -S python-pydub
+pip install build
 sudo pacman -S python-scipy
