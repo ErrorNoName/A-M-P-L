@@ -1,21 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Script repensé pour gérer un micro virtuel sous ArchLinux avec traitement audio,
-en redirigeant correctement le signal du micro physique vers le micro virtuel.
-
-Fonctionnalités :
- - Détection et visualisation du niveau audio du micro physique (via sounddevice).
- - Sélection du micro d'entrée parmi ceux détectés.
- - Contrôle du volume via un slider (0 à 700) et un bouton "Loud Mic".
- - Passage en mode micro virtuel : création d'un null-sink et redirection du son
-   via un flux full‑duplex qui applique un effet (None, Pan Left, Stutter) et un gain.
- - Bouton "Fix Audio" pour décharger les modules PulseAudio associés.
- 
-Remarques :
- • Certains messages ALSA/PulseAudio peuvent subsister selon la configuration système.
- • Si nécessaire, adaptez votre fichier ~/.asoundrc pour forcer l'utilisation d'un périphérique stable.
- • Sous Wayland, lancez avec QT_QPA_PLATFORM=wayland.
+ErrorNoName LunarWave Update V2
 """
 
 import os
@@ -26,15 +12,15 @@ import numpy as np
 import threading
 import sounddevice as sd
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
-from PyQt5.QtGui import QPainter
+from PyQt5.QtGui import QPainter, QPalette, QColor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QLineEdit, QPushButton, QSlider
 )
 
-# Masquer certains messages d'erreur d'ALSA
+# Masquer certains messages ALSA
 os.environ["ALSA_LOGLEVEL"] = "quiet"
-# Décommentez la ligne suivante si vous utilisez Wayland :
+# Décommentez si nécessaire sous Wayland:
 # os.environ["QT_QPA_PLATFORM"] = "wayland"
 
 def run_cmd(cmd_list):
@@ -102,7 +88,7 @@ class AudioPreviewThread(QThread):
 # --- Thread de traitement audio pour le micro virtuel ---
 class ProcessingThread(QThread):
     # Ce thread capte l'audio du micro physique, y applique un effet et un gain,
-    # puis envoie le signal vers la sortie virtuelle (null-sink).
+    # puis envoie le signal vers la sortie (null-sink).
     def __init__(self, in_device, out_device, samplerate, effect="None", gain=1.0, parent=None):
         super().__init__(parent)
         self.in_device = in_device
@@ -113,16 +99,19 @@ class ProcessingThread(QThread):
         self.running = True
         self.channels_in = 1
         self.channels_out = 2
+        # Pour l'effet Echo, initialisation d'un buffer et d'un index
+        self.echo_buffer = None
+        self.echo_index = 0
 
     def callback(self, indata, outdata, frames, time_info, status):
         if status:
             print(status)
+        # Signal de base après gain
+        signal = self.gain * indata[:, 0]
         if self.effect == "None":
-            signal = self.gain * indata[:, 0]
             outdata[:, 0] = signal
             outdata[:, 1] = signal
         elif self.effect == "Pan Left":
-            signal = self.gain * indata[:, 0]
             outdata[:, 0] = signal
             outdata[:, 1] = 0
         elif self.effect == "Stutter":
@@ -130,11 +119,46 @@ class ProcessingThread(QThread):
             if (t % 0.6) < 0.1:
                 outdata[:] = 0
             else:
-                signal = self.gain * indata[:, 0]
                 outdata[:, 0] = signal
                 outdata[:, 1] = signal
+        elif self.effect == "Rapid Stutter":
+            t = time.time()
+            if (t % 0.2) < 0.05:
+                outdata[:] = 0
+            else:
+                outdata[:, 0] = signal
+                outdata[:, 1] = signal
+        elif self.effect == "Ultra Loud":
+            ultra_signal = 20 * signal
+            clipped = np.tanh(ultra_signal)
+            outdata[:, 0] = clipped
+            outdata[:, 1] = clipped
+        elif self.effect == "Ultra Loud Raw":
+            raw_signal = 50 * signal
+            outdata[:, 0] = raw_signal
+            outdata[:, 1] = raw_signal
+        elif self.effect == "Bit Crusher":
+            quant_levels = 16
+            crushed = np.round(signal * quant_levels) / quant_levels
+            outdata[:, 0] = crushed
+            outdata[:, 1] = crushed
+        elif self.effect == "Echo":
+            # Initialisation du buffer d'écho si nécessaire
+            if self.echo_buffer is None:
+                delay_sec = 0.3
+                self.delay_samples = int(self.samplerate * delay_sec)
+                self.echo_buffer = np.zeros(self.delay_samples)
+                self.echo_index = 0
+            feedback = 0.5
+            out = np.empty_like(signal)
+            for i in range(len(signal)):
+                echo_sample = self.echo_buffer[self.echo_index]
+                out[i] = signal[i] + feedback * echo_sample
+                self.echo_buffer[self.echo_index] = signal[i]
+                self.echo_index = (self.echo_index + 1) % self.delay_samples
+            outdata[:, 0] = out
+            outdata[:, 1] = out
         else:
-            signal = self.gain * indata[:, 0]
             outdata[:, 0] = signal
             outdata[:, 1] = signal
 
@@ -181,7 +205,7 @@ class MainWindow(QMainWindow):
         self.preview_thread = None
         self.mic_info = {}
 
-        # Lock pour éviter l'accès concurrent
+        # Lock pour éviter les accès concurrents
         self.preview_lock = threading.Lock()
 
         # Interface graphique
@@ -207,10 +231,10 @@ class MainWindow(QMainWindow):
         virt_layout.addWidget(self.virt_lineedit)
         layout.addLayout(virt_layout)
 
-        # Contrôle du volume (0 à 700)
+        # Contrôle du volume (0 à 1000)
         vol_layout = QHBoxLayout()
         self.vol_slider = QSlider(Qt.Horizontal)
-        self.vol_slider.setRange(0, 700)
+        self.vol_slider.setRange(0, 1000)
         self.vol_slider.setValue(100)
         self.vol_slider.valueChanged.connect(self.on_volume_changed)
         vol_layout.addWidget(QLabel("Volume:"))
@@ -224,7 +248,7 @@ class MainWindow(QMainWindow):
         effect_layout = QHBoxLayout()
         effect_label = QLabel("Effet audio:")
         self.effect_combo = QComboBox()
-        self.effect_combo.addItems(["None", "Pan Left", "Stutter"])
+        self.effect_combo.addItems(["None", "Pan Left", "Stutter", "Rapid Stutter", "Ultra Loud", "Ultra Loud Raw", "Bit Crusher", "Echo"])
         self.effect_combo.currentIndexChanged.connect(self.on_effect_changed)
         effect_layout.addWidget(effect_label)
         effect_layout.addWidget(self.effect_combo)
@@ -295,7 +319,7 @@ class MainWindow(QMainWindow):
                 self.preview_thread = None
 
     def on_volume_changed(self, value):
-        # Met à jour le gain dans le traitement audio si actif (gain = value/100)
+        # Met à jour le gain dans le traitement si actif (gain = value/100)
         if self.processing_thread is not None:
             self.processing_thread.gain = value / 100.0
 
@@ -310,8 +334,8 @@ class MainWindow(QMainWindow):
         run_cmd(["pactl", "set-source-volume", target, f"{value}%"])
 
     def loud_mic(self):
-        self.vol_slider.setValue(700)
-        self.on_volume_changed(700)
+        self.vol_slider.setValue(1000)
+        self.on_volume_changed(1000)
 
     def on_effect_changed(self, index):
         effect = self.effect_combo.currentText()
@@ -330,21 +354,27 @@ class MainWindow(QMainWindow):
         # Arrêter la prévisualisation
         self.stop_preview()
 
-        # Créer le null-sink virtuel
+        # Vérifier si le micro virtuel existe ; sinon, le créer
         virtual_name = self.virt_lineedit.text()
-        try:
-            output = subprocess.check_output(
-                ["pactl", "load-module", "module-null-sink",
-                 "sink_name=virt_sink",
-                 f"sink_properties=device.description={virtual_name}"],
-                stderr=subprocess.DEVNULL
-            )
-            self.virtual_sink_module_id = output.decode().strip()
-        except subprocess.CalledProcessError as e:
-            print("Erreur lors de la création du micro virtuel:", e)
-            return
+        existing_source = get_pulseaudio_source(virtual_name)
+        if existing_source is None:
+            try:
+                output = subprocess.check_output(
+                    ["pactl", "load-module", "module-null-sink",
+                     "sink_name=virt_sink",
+                     f"sink_properties=device.description={virtual_name}"],
+                    stderr=subprocess.DEVNULL
+                )
+                self.virtual_sink_module_id = output.decode().strip()
+                print("Micro virtuel créé.")
+            except subprocess.CalledProcessError as e:
+                print("Erreur lors de la création du micro virtuel:", e)
+                return
+        else:
+            print("Micro virtuel déjà existant.")
+            self.virtual_sink_module_id = "exist"
 
-        # Attendre que PulseAudio mette à jour la liste des dispositifs
+        # Attendre que PulseAudio mette à jour la liste
         time.sleep(1)
 
         # Recharger la liste des dispositifs de sortie pour trouver le null-sink
@@ -352,7 +382,7 @@ class MainWindow(QMainWindow):
         try:
             devices = sd.query_devices()
             for i, dev in enumerate(devices):
-                if ("virt_sink" in dev.get("name", "").lower() or virtual_name.lower() in dev.get("name", "").lower()) \
+                if (("virt_sink" in dev.get("name", "").lower()) or (virtual_name.lower() in dev.get("name", "").lower())) \
                    and dev.get("max_output_channels", 0) > 0:
                     out_device = i
                     break
@@ -364,7 +394,7 @@ class MainWindow(QMainWindow):
             print("Dispositif de sortie virtuel introuvable.")
             return
 
-        # Démarrer le thread de traitement : capture du micro physique et envoi vers le null-sink
+        # Démarrer le thread de traitement : capture du micro physique vers le null-sink
         physical_device_index = self.mic_combo.currentData()
         if physical_device_index is None:
             print("Aucun micro physique sélectionné.")
@@ -392,6 +422,12 @@ class MainWindow(QMainWindow):
     def fix_audio(self):
         print("Tentative de réinitialisation des modules audio...")
         try:
+            # Si le micro virtuel n'existe pas, le créer
+            if get_pulseaudio_source("VirtualMic") is None:
+                print("VirtualMic non trouvé, création du micro virtuel...")
+                run_cmd(["pactl", "load-module", "module-null-sink",
+                         "sink_name=virt_sink",
+                         "sink_properties=device.description=VirtualMic"])
             output = subprocess.check_output(
                 ["pactl", "list", "short", "modules"],
                 stderr=subprocess.DEVNULL
@@ -419,6 +455,25 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+
+    # Appliquer un thème sombre à l'application
+    app.setStyle("Fusion")
+    dark_palette = QPalette()
+    dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
+    dark_palette.setColor(QPalette.WindowText, Qt.white)
+    dark_palette.setColor(QPalette.Base, QColor(25, 25, 25))
+    dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+    dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
+    dark_palette.setColor(QPalette.ToolTipText, Qt.white)
+    dark_palette.setColor(QPalette.Text, Qt.white)
+    dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
+    dark_palette.setColor(QPalette.ButtonText, Qt.white)
+    dark_palette.setColor(QPalette.BrightText, Qt.red)
+    dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
+    dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+    dark_palette.setColor(QPalette.HighlightedText, Qt.black)
+    app.setPalette(dark_palette)
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
