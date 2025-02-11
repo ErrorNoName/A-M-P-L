@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ErrorNoName LunarWave Update V2
+ErrorNoName LunarWave Update V2 BETA
 """
 
 import os
@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
 
 # Masquer certains messages ALSA
 os.environ["ALSA_LOGLEVEL"] = "quiet"
-# Pour Wayland (si besoin) décommentez :
+# Sous Wayland, décommentez la ligne suivante si nécessaire :
 # os.environ["QT_QPA_PLATFORM"] = "wayland"
 
 def run_cmd(cmd_list):
@@ -53,6 +53,17 @@ def get_pulseaudio_source(description):
             if description.lower() in current_source["Description"].lower():
                 return current_source["Name"]
     return None
+
+def pitch_shift(signal, factor):
+    """
+    Applique un simple pitch shift au signal mono en rééchantillonnant par interpolation.
+    Le paramètre 'factor' > 1 augmente le pitch, < 1 le diminue.
+    """
+    n = len(signal)
+    original_indices = np.arange(n)
+    new_indices = original_indices / factor
+    shifted = np.interp(original_indices, new_indices, signal, left=0, right=0)
+    return shifted
 
 # --- Thread de capture audio pour la prévisualisation (sans traitement) ---
 class AudioPreviewThread(QThread):
@@ -87,15 +98,16 @@ class AudioPreviewThread(QThread):
 
 # --- Thread de traitement audio pour le micro virtuel ---
 class ProcessingThread(QThread):
-    # Ce thread capte l'audio du micro physique, y applique un effet et un gain,
+    # Ce thread capte l'audio du micro physique, y applique un effet audio ET un effet de voix,
     # puis envoie le signal vers la sortie (null-sink).
-    def __init__(self, in_device, out_device, samplerate, effect="None", gain=1.0, parent=None):
+    def __init__(self, in_device, out_device, samplerate, effect="None", gain=1.0, voice_effect="None", parent=None):
         super().__init__(parent)
         self.in_device = in_device
         self.out_device = out_device
         self.samplerate = samplerate
         self.effect = effect
         self.gain = gain
+        self.voice_effect = voice_effect
         self.running = True
         self.channels_in = 1
         self.channels_out = 2
@@ -108,42 +120,27 @@ class ProcessingThread(QThread):
     def callback(self, indata, outdata, frames, time_info, status):
         if status:
             print(status)
-        # Signal de base avec gain appliqué
+        # Signal de base après gain
         signal = self.gain * indata[:, 0]
+        # Appliquer l'effet audio sélectionné
         if self.effect == "None":
-            outdata[:, 0] = signal
-            outdata[:, 1] = signal
+            processed = signal
         elif self.effect == "Pan Left":
-            outdata[:, 0] = signal
-            outdata[:, 1] = 0
+            processed = signal  # Puis nous gérons la duplication sur canaux plus bas
         elif self.effect == "Stutter":
             t = time.time()
-            if (t % 0.6) < 0.1:
-                outdata[:] = 0
-            else:
-                outdata[:, 0] = signal
-                outdata[:, 1] = signal
+            processed = signal if (t % 0.6) >= 0.1 else np.zeros_like(signal)
         elif self.effect == "Rapid Stutter":
             t = time.time()
-            if (t % 0.2) < 0.05:
-                outdata[:] = 0
-            else:
-                outdata[:, 0] = signal
-                outdata[:, 1] = signal
+            processed = signal if (t % 0.2) >= 0.05 else np.zeros_like(signal)
         elif self.effect == "Ultra Loud":
             ultra_signal = 20 * signal
-            clipped = np.tanh(ultra_signal)
-            outdata[:, 0] = clipped
-            outdata[:, 1] = clipped
+            processed = np.tanh(ultra_signal)
         elif self.effect == "Ultra Loud Raw":
-            raw_signal = 50 * signal
-            outdata[:, 0] = raw_signal
-            outdata[:, 1] = raw_signal
+            processed = 50 * signal
         elif self.effect == "Bit Crusher":
             quant_levels = 16
-            crushed = np.round(signal * quant_levels) / quant_levels
-            outdata[:, 0] = crushed
-            outdata[:, 1] = crushed
+            processed = np.round(signal * quant_levels) / quant_levels
         elif self.effect == "Echo":
             if self.echo_buffer is None:
                 delay_sec = 0.3
@@ -151,31 +148,47 @@ class ProcessingThread(QThread):
                 self.echo_buffer = np.zeros(self.delay_samples)
                 self.echo_index = 0
             feedback = 0.5
-            out = np.empty_like(signal)
+            processed = np.empty_like(signal)
             for i in range(len(signal)):
                 echo_sample = self.echo_buffer[self.echo_index]
-                out[i] = signal[i] + feedback * echo_sample
+                processed[i] = signal[i] + feedback * echo_sample
                 self.echo_buffer[self.echo_index] = signal[i]
                 self.echo_index = (self.echo_index + 1) % self.delay_samples
-            outdata[:, 0] = out
-            outdata[:, 1] = out
         elif self.effect == "Ultra BoostBass":
-            # Initialiser la partie basse si non encore fait
             if not self.bass_initialized:
-                fc = 200.0  # Fréquence de coupure pour les basses
+                fc = 200.0  # Fréquence de coupure (Hz) pour les basses
                 self.bass_alpha = np.exp(-2 * np.pi * fc / self.samplerate)
                 self.bass_state = 0.0
                 self.boost_factor = 20.0  # Facteur de boost pour les basses
                 self.bass_initialized = True
-            out = np.empty_like(signal)
+            processed = np.empty_like(signal)
             for i in range(len(signal)):
                 self.bass_state = (1 - self.bass_alpha) * signal[i] + self.bass_alpha * self.bass_state
-                out[i] = signal[i] + self.boost_factor * self.bass_state
-            outdata[:, 0] = out
-            outdata[:, 1] = out
+                processed[i] = signal[i] + self.boost_factor * self.bass_state
         else:
-            outdata[:, 0] = signal
-            outdata[:, 1] = signal
+            processed = signal
+
+        # Réplication sur deux canaux (pour la sortie stéréo)
+        stereo = np.column_stack((processed, processed))
+        
+        # Appliquer l'effet de voix (pitch shift) si demandé
+        if self.voice_effect != "None":
+            voice_effect_factors = {
+                "Voice Femme": 1.2,
+                "Voice Homme": 0.8,
+                "Deep Voice": 0.7,
+                "Belle Voix": 1.1
+            }
+            factor = voice_effect_factors.get(self.voice_effect, 1.0)
+            # Appliquer le pitch shift sur chaque canal
+            stereo[:,0] = pitch_shift(stereo[:,0], factor)
+            stereo[:,1] = pitch_shift(stereo[:,1], factor)
+        
+        # Pour "Pan Left", forcer le canal droit à zéro
+        if self.effect == "Pan Left":
+            stereo[:,1] = 0
+
+        outdata[:] = stereo
 
     def run(self):
         try:
@@ -219,6 +232,7 @@ class MainWindow(QMainWindow):
         self.processing_thread = None
         self.preview_thread = None
         self.mic_info = {}
+        self.voice_effect = "None"  # Valeur par défaut pour l'effet voix
 
         # Lock pour éviter les accès concurrents
         self.preview_lock = threading.Lock()
@@ -268,6 +282,16 @@ class MainWindow(QMainWindow):
         effect_layout.addWidget(effect_label)
         effect_layout.addWidget(self.effect_combo)
         layout.addLayout(effect_layout)
+
+        # Choix de l'effet voix
+        voice_layout = QHBoxLayout()
+        voice_label = QLabel("Effet Voix:")
+        self.voice_combo = QComboBox()
+        self.voice_combo.addItems(["None", "Voice Femme", "Voice Homme", "Deep Voice", "Belle Voix"])
+        self.voice_combo.currentIndexChanged.connect(self.on_voice_effect_changed)
+        voice_layout.addWidget(voice_label)
+        voice_layout.addWidget(self.voice_combo)
+        layout.addLayout(voice_layout)
 
         # Boutons Start/Stop et Fix Audio
         btn_layout = QHBoxLayout()
@@ -336,7 +360,6 @@ class MainWindow(QMainWindow):
     def on_volume_changed(self, value):
         if self.processing_thread is not None:
             self.processing_thread.gain = value / 100.0
-
         if self.virtual_sink_module_id is not None:
             target = "virt_sink.monitor"
         else:
@@ -355,6 +378,11 @@ class MainWindow(QMainWindow):
         if self.processing_thread is not None:
             self.processing_thread.effect = effect
 
+    def on_voice_effect_changed(self, index):
+        self.voice_effect = self.voice_combo.currentText()
+        if self.processing_thread is not None:
+            self.processing_thread.voice_effect = self.voice_effect
+
     def toggle_virtual_mic(self, checked):
         if checked:
             self.start_button.setText("Stop")
@@ -365,7 +393,6 @@ class MainWindow(QMainWindow):
 
     def start_virtual_mic(self):
         self.stop_preview()
-
         virtual_name = self.virt_lineedit.text()
         existing_source = get_pulseaudio_source(virtual_name)
         if existing_source is None:
@@ -384,24 +411,21 @@ class MainWindow(QMainWindow):
         else:
             print("Micro virtuel déjà existant.")
             self.virtual_sink_module_id = "exist"
-
         time.sleep(1)
-
         out_device = None
         try:
             devices = sd.query_devices()
             for i, dev in enumerate(devices):
-                if (("virt_sink" in dev.get("name", "").lower()) or (virtual_name.lower() in dev.get("name", "").lower())) and dev.get("max_output_channels", 0) > 0:
+                if (("virt_sink" in dev.get("name", "").lower()) or (virtual_name.lower() in dev.get("name", "").lower())) \
+                   and dev.get("max_output_channels", 0) > 0:
                     out_device = i
                     break
         except Exception as e:
             print("Erreur lors de la recherche du dispositif de sortie virtuel:", e)
             return
-
         if out_device is None:
             print("Dispositif de sortie virtuel introuvable.")
             return
-
         physical_device_index = self.mic_combo.currentData()
         if physical_device_index is None:
             print("Aucun micro physique sélectionné.")
@@ -410,8 +434,9 @@ class MainWindow(QMainWindow):
         sample_rate = int(dev_info.get("default_samplerate", 44100))
         gain = self.vol_slider.value() / 100.0
         effect = self.effect_combo.currentText()
+        voice_effect = self.voice_effect  # Valeur actuellement sélectionnée
         self.processing_thread = ProcessingThread(physical_device_index, out_device, sample_rate,
-                                                   effect=effect, gain=gain)
+                                                   effect=effect, gain=gain, voice_effect=voice_effect)
         self.processing_thread.start()
 
     def stop_virtual_mic(self):
@@ -461,8 +486,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-
-    # Appliquer un thème sombre
+    # Appliquer un thème sombre à l'application
     app.setStyle("Fusion")
     dark_palette = QPalette()
     dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
