@@ -711,7 +711,7 @@ class VirtualMonitorThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("C O F U / Config Micro Ultra BETA2")
+        self.setWindowTitle("Gestionnaire de Micro Virtuel Avancé")
         self.virtual_sink_module_id = None
         self.processing_thread = None
         self.preview_thread = None
